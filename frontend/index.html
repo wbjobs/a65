@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>结构生成器 - BESO</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { overflow: hidden; font-family: 'Segoe UI', sans-serif; background: #1a1a2e; }
+        #canvas-container { width: 100vw; height: 100vh; position: relative; }
+        #ui-panel {
+            position: absolute; top: 20px; left: 20px;
+            background: rgba(22, 33, 62, 0.95); color: #eaeaea;
+            padding: 20px; border-radius: 12px;
+            min-width: 280px; box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+            backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.1);
+        }
+        #ui-panel h2 { font-size: 18px; margin-bottom: 16px; color: #00d9ff; }
+        .tool-group { margin-bottom: 16px; }
+        .tool-group label { display: block; font-size: 12px; margin-bottom: 6px; color: #8892b0; text-transform: uppercase; letter-spacing: 1px; }
+        .tool-btn {
+            padding: 10px 16px; margin-right: 8px; border: 2px solid #233554;
+            background: transparent; color: #eaeaea; border-radius: 8px;
+            cursor: pointer; font-size: 14px; transition: all 0.2s;
+        }
+        .tool-btn:hover { border-color: #00d9ff; background: rgba(0, 217, 255, 0.1); }
+        .tool-btn.active { background: #00d9ff; color: #0a192f; border-color: #00d9ff; font-weight: 600; }
+        .control-btn {
+            width: 100%; padding: 12px; margin-top: 8px; border: none;
+            background: linear-gradient(135deg, #00d9ff, #0099cc); color: #0a192f;
+            border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 600;
+            transition: all 0.2s; text-transform: uppercase; letter-spacing: 1px;
+        }
+        .control-btn:hover { transform: translateY(-2px); box-shadow: 0 4px 16px rgba(0, 217, 255, 0.4); }
+        .control-btn:disabled { background: #233554; color: #555; cursor: not-allowed; transform: none; box-shadow: none; }
+        .control-btn.reset { background: linear-gradient(135deg, #ff6b6b, #cc4444); }
+        .control-btn.reset:hover { box-shadow: 0 4px 16px rgba(255, 107, 107, 0.4); }
+        #status {
+            margin-top: 16px; padding: 12px; background: rgba(0,0,0,0.3);
+            border-radius: 8px; font-size: 12px; line-height: 1.6;
+        }
+        #status .item { display: flex; justify-content: space-between; padding: 3px 0; }
+        #status .label { color: #8892b0; }
+        #status .value { color: #00d9ff; font-weight: 600; }
+        .progress-bar { height: 6px; background: #233554; border-radius: 3px; margin-top: 8px; overflow: hidden; }
+        .progress-fill { height: 100%; background: linear-gradient(90deg, #00d9ff, #00ff88); border-radius: 3px; transition: width 0.3s; width: 0%; }
+        #instructions {
+            position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+            background: rgba(22, 33, 62, 0.9); color: #8892b0; padding: 12px 24px;
+            border-radius: 8px; font-size: 13px; text-align: center;
+            border: 1px solid rgba(255,255,255,0.05);
+        }
+        #instructions span { color: #00d9ff; font-weight: 600; }
+    </style>
+</head>
+<body>
+    <div id="canvas-container"></div>
+    <div id="ui-panel">
+        <h2>🧱 结构生成器 BESO</h2>
+        <div class="tool-group">
+            <label>放置模式</label>
+            <button class="tool-btn active" data-tool="load">↓ 受力点</button>
+            <button class="tool-btn" data-tool="support">▲ 支撑点</button>
+            <button class="tool-btn" data-tool="none">✋ 无</button>
+        </div>
+        <div class="tool-group">
+            <label>目标体积: <span id="volume-value">40</span>%</label>
+            <input type="range" id="volume-slider" min="10" max="80" value="40" style="width:100%">
+        </div>
+        <button class="control-btn" id="start-btn">▶ 开始优化</button>
+        <button class="control-btn" id="step-btn">⏭ 单步迭代</button>
+        <button class="control-btn reset" id="reset-btn">↺ 重置</button>
+        <div id="status">
+            <div class="item"><span class="label">连接状态:</span><span class="value" id="conn-status">未连接</span></div>
+            <div class="item"><span class="label">迭代次数:</span><span class="value" id="iter-count">0</span></div>
+            <div class="item"><span class="label">当前体积:</span><span class="value" id="current-vol">100%</span></div>
+            <div class="item"><span class="label">受力点:</span><span class="value" id="load-count">0</span></div>
+            <div class="item"><span class="label">支撑点:</span><span class="value" id="support-count">0</span></div>
+            <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+        </div>
+    </div>
+    <div id="instructions">
+        鼠标左键点击体素放置 <span>受力点</span> 或 <span>支撑点</span> ｜ 右键拖动旋转视角 ｜ 滚轮缩放
+    </div>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+    <script type="module" src="app.js"></script>
+</body>
+</html>
