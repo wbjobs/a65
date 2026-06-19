@@ -4,22 +4,27 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 const GRID_SIZE = 20;
 const VOXEL_SIZE = 1;
 const GAP = 0.05;
+const TOTAL_VOXELS = GRID_SIZE * GRID_SIZE * GRID_SIZE;
 
 let scene, camera, renderer, controls;
-let voxelMeshes = [];
-let voxelExists = [];
-let voxelStress = [];
+let voxelMesh;
+let dummyMatrix;
+let voxelExists = new Uint8Array(TOTAL_VOXELS);
+let voxelStress = new Float32Array(TOTAL_VOXELS);
 let loadPoints = new Set();
 let supportPoints = new Set();
 let raycaster, mouse;
 let hoverIndicator;
+let loadMarkers = [];
+let supportMarkers = [];
+
+let instancesDirty = true;
+let colorsDirty = true;
 
 let currentTool = 'load';
 let isOptimizing = false;
 let ws = null;
 let isConnected = false;
-
-const totalVoxels = GRID_SIZE * GRID_SIZE * GRID_SIZE;
 
 function idx(x, y, z) {
     return x + y * GRID_SIZE + z * GRID_SIZE * GRID_SIZE;
@@ -32,7 +37,9 @@ function coordFromIdx(i) {
     return { x, y, z };
 }
 
-function stressToColor(stress) {
+function stressToColor(stress, isLoad, isSupport) {
+    if (isLoad) return new THREE.Color(0xff6b6b);
+    if (isSupport) return new THREE.Color(0x00d9ff);
     const s = Math.max(0, Math.min(1, stress));
     const r = Math.min(1, s * 2);
     const g = Math.min(1, 2 - s * 2);
@@ -47,6 +54,38 @@ function voxelWorldPos(x, y, z) {
         y * (VOXEL_SIZE + GAP) - offset,
         z * (VOXEL_SIZE + GAP) - offset
     );
+}
+
+async function decodeMessagePack(buffer) {
+    const { decode } = await import('https://esm.sh/@msgpack/msgpack@3.0.0-beta2');
+    return decode(buffer);
+}
+
+async function decompressGzip(buffer) {
+    try {
+        const ds = new DecompressionStream('gzip');
+        const blob = new Blob([buffer]);
+        const decompressedStream = blob.stream().pipeThrough(ds);
+        const reader = decompressedStream.getReader();
+        const chunks = [];
+        let result;
+        do {
+            result = await reader.read();
+            if (result.value) chunks.push(result.value);
+        } while (!result.done);
+
+        const totalLength = chunks.reduce((sum, c) => sum + c.length, 0);
+        const decompressed = new Uint8Array(totalLength);
+        let offset = 0;
+        for (const chunk of chunks) {
+            decompressed.set(chunk, offset);
+            offset += chunk.length;
+        }
+        return decompressed;
+    } catch (e) {
+        console.warn('Gzip decompression failed, trying raw:', e);
+        return new Uint8Array(buffer);
+    }
 }
 
 function init() {
@@ -82,21 +121,19 @@ function init() {
     dirLight.castShadow = true;
     dirLight.shadow.mapSize.width = 2048;
     dirLight.shadow.mapSize.height = 2048;
-    dirLight.shadow.camera.near = 0.5;
-    dirLight.shadow.camera.far = 100;
-    dirLight.shadow.camera.left = -30;
-    dirLight.shadow.camera.right = 30;
-    dirLight.shadow.camera.top = 30;
-    dirLight.shadow.camera.bottom = -30;
     scene.add(dirLight);
 
     const fillLight = new THREE.DirectionalLight(0x00d9ff, 0.2);
     fillLight.position.set(-20, 10, -20);
     scene.add(fillLight);
 
+    dummyMatrix = new THREE.Matrix4();
+
     createGroundGrid();
-    createVoxelGrid();
+    createInstancedVoxels();
     createHoverIndicator();
+
+    voxelExists.fill(1);
 
     raycaster = new THREE.Raycaster();
     mouse = new THREE.Vector2();
@@ -128,34 +165,45 @@ function createGroundGrid() {
     scene.add(ground);
 }
 
-function createVoxelGrid() {
+function createInstancedVoxels() {
     const geometry = new THREE.BoxGeometry(VOXEL_SIZE, VOXEL_SIZE, VOXEL_SIZE);
+
     const material = new THREE.MeshStandardMaterial({
-        color: 0x4a5568,
         roughness: 0.5,
         metalness: 0.3,
-        transparent: true,
-        opacity: 0.7
+        vertexColors: false
     });
 
-    for (let z = 0; z < GRID_SIZE; z++) {
-        for (let y = 0; y < GRID_SIZE; y++) {
-            for (let x = 0; x < GRID_SIZE; x++) {
-                const i = idx(x, y, z);
-                const mesh = new THREE.Mesh(geometry, material.clone());
-                const pos = voxelWorldPos(x, y, z);
-                mesh.position.copy(pos);
-                mesh.castShadow = true;
-                mesh.receiveShadow = true;
-                mesh.userData = { x, y, z, index: i };
-                mesh.visible = true;
-                scene.add(mesh);
-                voxelMeshes.push(mesh);
-                voxelExists.push(true);
-                voxelStress.push(0);
-            }
-        }
+    voxelMesh = new THREE.InstancedMesh(geometry, material, TOTAL_VOXELS);
+    voxelMesh.castShadow = true;
+    voxelMesh.receiveShadow = true;
+    voxelMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+
+    voxelMesh.userData.voxelIndices = new Array(TOTAL_VOXELS);
+
+    const identityMatrix = new THREE.Matrix4();
+    const hiddenMatrix = new THREE.Matrix4().makeScale(0, 0, 0);
+
+    for (let i = 0; i < TOTAL_VOXELS; i++) {
+        const { x, y, z } = coordFromIdx(i);
+        const pos = voxelWorldPos(x, y, z);
+        dummyMatrix.makeTranslation(pos.x, pos.y, pos.z);
+        voxelMesh.setMatrixAt(i, dummyMatrix);
+        voxelMesh.userData.voxelIndices[i] = i;
     }
+
+    voxelMesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(TOTAL_VOXELS * 3), 3);
+    voxelMesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
+
+    const defaultColor = new THREE.Color(0x4a5568);
+    for (let i = 0; i < TOTAL_VOXELS; i++) {
+        voxelMesh.setColorAt(i, defaultColor);
+    }
+
+    voxelMesh.instanceMatrix.needsUpdate = true;
+    voxelMesh.instanceColor.needsUpdate = true;
+
+    scene.add(voxelMesh);
 }
 
 function createHoverIndicator() {
@@ -171,42 +219,60 @@ function createHoverIndicator() {
     scene.add(hoverIndicator);
 }
 
-function updateVoxelVisual(i) {
-    const mesh = voxelMeshes[i];
+function updateVoxelInstance(i) {
     const exists = voxelExists[i];
     const isLoad = loadPoints.has(i);
     const isSupport = supportPoints.has(i);
 
-    mesh.visible = exists || isLoad || isSupport;
+    if (exists || isLoad || isSupport) {
+        const { x, y, z } = coordFromIdx(i);
+        const pos = voxelWorldPos(x, y, z);
+        const scale = isLoad || isSupport ? 1.15 : 1.0;
+        dummyMatrix.compose(
+            new THREE.Vector3(pos.x, pos.y, pos.z),
+            new THREE.Quaternion(),
+            new THREE.Vector3(scale, scale, scale)
+        );
+        voxelMesh.setMatrixAt(i, dummyMatrix);
 
-    if (!mesh.visible) return;
-
-    if (isLoad) {
-        mesh.material.color.setHex(0xff6b6b);
-        mesh.material.opacity = 1;
-        mesh.material.emissive = new THREE.Color(0xff3333);
-        mesh.material.emissiveIntensity = 0.5;
-        mesh.scale.setScalar(1.15);
-    } else if (isSupport) {
-        mesh.material.color.setHex(0x00d9ff);
-        mesh.material.opacity = 1;
-        mesh.material.emissive = new THREE.Color(0x0099cc);
-        mesh.material.emissiveIntensity = 0.5;
-        mesh.scale.setScalar(1.15);
-    } else if (exists) {
-        const stress = voxelStress[i];
-        mesh.material.color.copy(stressToColor(stress));
-        mesh.material.opacity = 0.85;
-        mesh.material.emissive = new THREE.Color(0x000000);
-        mesh.material.emissiveIntensity = 0;
-        mesh.scale.setScalar(1);
+        const color = stressToColor(voxelStress[i], isLoad, isSupport);
+        voxelMesh.setColorAt(i, color);
+    } else {
+        dummyMatrix.makeScale(0, 0, 0);
+        voxelMesh.setMatrixAt(i, dummyMatrix);
     }
+
+    instancesDirty = true;
 }
 
-function updateAllVoxelsVisual() {
-    for (let i = 0; i < totalVoxels; i++) {
-        updateVoxelVisual(i);
+function updateAllInstances() {
+    const hiddenMatrix = new THREE.Matrix4().makeScale(0, 0, 0);
+    const color = new THREE.Color();
+
+    for (let i = 0; i < TOTAL_VOXELS; i++) {
+        const exists = voxelExists[i];
+        const isLoad = loadPoints.has(i);
+        const isSupport = supportPoints.has(i);
+
+        if (exists || isLoad || isSupport) {
+            const { x, y, z } = coordFromIdx(i);
+            const pos = voxelWorldPos(x, y, z);
+            const scale = isLoad || isSupport ? 1.15 : 1.0;
+            dummyMatrix.compose(
+                new THREE.Vector3(pos.x, pos.y, pos.z),
+                new THREE.Quaternion(),
+                new THREE.Vector3(scale, scale, scale)
+            );
+            voxelMesh.setMatrixAt(i, dummyMatrix);
+
+            const c = stressToColor(voxelStress[i], isLoad, isSupport);
+            voxelMesh.setColorAt(i, c);
+        } else {
+            voxelMesh.setMatrixAt(i, hiddenMatrix);
+        }
     }
+
+    instancesDirty = true;
 }
 
 function setupEventListeners() {
@@ -223,20 +289,23 @@ function onMouseMove(event) {
     mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
 
     raycaster.setFromCamera(mouse, camera);
-    const intersects = raycaster.intersectObjects(voxelMeshes.filter(m => m.visible));
+    const intersects = raycaster.intersectObject(voxelMesh);
 
     if (intersects.length > 0 && currentTool !== 'none') {
         const hit = intersects[0];
-        hoverIndicator.position.copy(hit.object.position);
-        hoverIndicator.visible = true;
-        if (currentTool === 'load') {
-            hoverIndicator.material.color.setHex(0xff6b6b);
-        } else if (currentTool === 'support') {
-            hoverIndicator.material.color.setHex(0x00d9ff);
+        const instanceId = hit.instanceId;
+        if (instanceId !== undefined) {
+            const { x, y, z } = coordFromIdx(instanceId);
+            const pos = voxelWorldPos(x, y, z);
+            hoverIndicator.position.copy(pos);
+            hoverIndicator.visible = true;
+            hoverIndicator.material.color.setHex(
+                currentTool === 'load' ? 0xff6b6b : 0x00d9ff
+            );
+            return;
         }
-    } else {
-        hoverIndicator.visible = false;
     }
+    hoverIndicator.visible = false;
 }
 
 function onMouseClick(event) {
@@ -246,34 +315,38 @@ function onMouseClick(event) {
     mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
 
     raycaster.setFromCamera(mouse, camera);
-    const intersects = raycaster.intersectObjects(voxelMeshes.filter(m => m.visible));
+    const intersects = raycaster.intersectObject(voxelMesh);
 
     if (intersects.length > 0) {
         const hit = intersects[0];
-        const { x, y, z, index: i } = hit.object.userData;
+        const instanceId = hit.instanceId;
+        if (instanceId !== undefined) {
+            const { x, y, z } = coordFromIdx(instanceId);
+            const i = instanceId;
 
-        if (currentTool === 'load') {
-            if (loadPoints.has(i)) {
-                loadPoints.delete(i);
-                sendMessage('removeLoad', { x, y, z });
-            } else {
-                supportPoints.delete(i);
-                loadPoints.add(i);
-                sendMessage('setLoad', { x, y, z });
+            if (currentTool === 'load') {
+                if (loadPoints.has(i)) {
+                    loadPoints.delete(i);
+                    sendMessage('removeLoad', { x, y, z });
+                } else {
+                    supportPoints.delete(i);
+                    loadPoints.add(i);
+                    sendMessage('setLoad', { x, y, z });
+                }
+            } else if (currentTool === 'support') {
+                if (supportPoints.has(i)) {
+                    supportPoints.delete(i);
+                    sendMessage('removeSupport', { x, y, z });
+                } else {
+                    loadPoints.delete(i);
+                    supportPoints.add(i);
+                    sendMessage('setSupport', { x, y, z });
+                }
             }
-        } else if (currentTool === 'support') {
-            if (supportPoints.has(i)) {
-                supportPoints.delete(i);
-                sendMessage('removeSupport', { x, y, z });
-            } else {
-                loadPoints.delete(i);
-                supportPoints.add(i);
-                sendMessage('setSupport', { x, y, z });
-            }
+
+            updateVoxelInstance(i);
+            updateStatusUI();
         }
-
-        updateVoxelVisual(i);
-        updateStatusUI();
     }
 }
 
@@ -328,11 +401,9 @@ function setupUI() {
         document.getElementById('start-btn').disabled = false;
         loadPoints.clear();
         supportPoints.clear();
-        for (let i = 0; i < totalVoxels; i++) {
-            voxelExists[i] = true;
-            voxelStress[i] = 0;
-        }
-        updateAllVoxelsVisual();
+        voxelExists.fill(1);
+        voxelStress.fill(0);
+        updateAllInstances();
         updateStatusUI();
         sendMessage('reset', {});
     });
@@ -345,17 +416,17 @@ function updateStatusUI(data) {
     document.getElementById('support-count').textContent = supportPoints.size;
 
     if (data) {
-        document.getElementById('iter-count').textContent = data.iteration || 0;
-        const volPercent = Math.round((data.volumeRatio || 1) * 100);
+        document.getElementById('iter-count').textContent = data.i || data.iteration || 0;
+        const volPercent = Math.round((data.vr || data.volumeRatio || 1) * 100);
         document.getElementById('current-vol').textContent = volPercent + '%';
-        const targetVol = data.targetVolume || 0.4;
-        const currentVol = data.volumeRatio || 1;
+        const targetVol = data.tv || data.targetVolume || 0.4;
+        const currentVol = data.vr || data.volumeRatio || 1;
         const progress = currentVol > targetVol
             ? Math.min(100, ((1 - currentVol) / (1 - targetVol)) * 100)
             : 100;
         document.getElementById('progress-fill').style.width = progress + '%';
 
-        if (data.isConverged) {
+        if (data.ic || data.isConverged) {
             isOptimizing = false;
             document.getElementById('start-btn').textContent = '✓ 完成';
             document.getElementById('start-btn').disabled = false;
@@ -399,28 +470,6 @@ function connectWebSocket() {
     };
 }
 
-async function decompressGzip(buffer) {
-    const ds = new DecompressionStream('gzip');
-    const blob = new Blob([buffer]);
-    const decompressedStream = blob.stream().pipeThrough(ds);
-    const reader = decompressedStream.getReader();
-    const chunks = [];
-    let result;
-    do {
-        result = await reader.read();
-        if (result.value) chunks.push(result.value);
-    } while (!result.done);
-
-    const totalLength = chunks.reduce((sum, c) => sum + c.length, 0);
-    const decompressed = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-        decompressed.set(chunk, offset);
-        offset += chunk.length;
-    }
-    return decompressed;
-}
-
 async function handleBinaryMessage(buffer) {
     const data = new Uint8Array(buffer);
     const msgType = data[0];
@@ -430,6 +479,14 @@ async function handleBinaryMessage(buffer) {
         await decodeFullGrid(payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength));
     } else if (msgType === 2) {
         await decodeVoxelChanges(payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength));
+    } else if (msgType === 3 || msgType === 4) {
+        try {
+            const decompressed = await decompressGzip(payload);
+            const state = await decodeMessagePack(decompressed);
+            updateStatusUI(state);
+        } catch (e) {
+            console.error('MsgPack decode error:', e);
+        }
     }
 }
 
@@ -448,7 +505,7 @@ async function decodeFullGrid(buffer) {
     for (let i = 0; i < total; i++) {
         const byteIdx = Math.floor(i / 8);
         const bitIdx = i % 8;
-        voxelExists[i] = ((data[offset + byteIdx] >> bitIdx) & 1) === 1;
+        voxelExists[i] = ((data[offset + byteIdx] >> bitIdx) & 1);
     }
     offset += bitCount;
 
@@ -459,50 +516,56 @@ async function decodeFullGrid(buffer) {
 
     loadPoints.clear();
     const loadCount = view.getUint32(offset, true); offset += 4;
+    const supportCount = view.getUint32(offset, true); offset += 4;
+
     for (let i = 0; i < loadCount; i++) {
         const idx = view.getUint16(offset, true); offset += 2;
         loadPoints.add(idx);
     }
 
-    supportPoints.clear();
-    const supportCount = view.getUint32(offset, true); offset += 4;
     for (let i = 0; i < supportCount; i++) {
         const idx = view.getUint16(offset, true); offset += 2;
         supportPoints.add(idx);
     }
 
-    updateAllVoxelsVisual();
+    updateAllInstances();
     updateStatusUI();
 }
 
 async function decodeVoxelChanges(buffer) {
-    const data = await decompressGzip(buffer);
-    const view = new DataView(data.buffer);
-    let offset = 0;
+    try {
+        const decompressed = await decompressGzip(buffer);
+        const changes = await decodeMessagePack(decompressed);
 
-    const count = view.getUint32(offset, true); offset += 4;
+        if (Array.isArray(changes)) {
+            for (const ch of changes) {
+                const index = ch.i || ch.index;
+                const action = ch.a || ch.action;
+                const stress = (ch.s || ch.stress || 0) / 255.0;
 
-    for (let i = 0; i < count; i++) {
-        const index = view.getUint16(offset, true); offset += 2;
-        offset += 6;
-        const action = data[offset]; offset += 1;
-        const stressByte = data[offset]; offset += 1;
-
-        if (action === 1) {
-            voxelExists[index] = true;
-        } else if (action === 2) {
-            voxelExists[index] = false;
+                if (action === 1) {
+                    voxelExists[index] = 1;
+                } else if (action === 2) {
+                    voxelExists[index] = 0;
+                }
+                voxelStress[index] = stress;
+                updateVoxelInstance(index);
+            }
         }
-        voxelStress[index] = stressByte / 255.0;
-        updateVoxelVisual(index);
+    } catch (e) {
+        console.error('Decode changes error:', e);
     }
 }
 
 function handleTextMessage(data) {
     try {
         const msg = JSON.parse(data);
-        if (msg.type === 'state' || msg.type === 'iteration' || msg.type === 'done') {
-            updateStatusUI(msg.payload);
+        if (msg.type === 'done') {
+            updateStatusUI({
+                iteration: msg.payload.iteration,
+                volumeRatio: msg.payload.volumeRatio,
+                isConverged: true
+            });
         }
     } catch (e) {
         console.error('JSON parse error:', e);
@@ -519,23 +582,39 @@ function animate() {
     requestAnimationFrame(animate);
     controls.update();
 
+    if (instancesDirty && voxelMesh) {
+        voxelMesh.instanceMatrix.needsUpdate = true;
+        voxelMesh.instanceColor.needsUpdate = true;
+        instancesDirty = false;
+    }
+
     const time = Date.now() * 0.001;
     loadPoints.forEach(i => {
-        const mesh = voxelMeshes[i];
-        if (mesh) {
+        if (voxelExists[i] || loadPoints.has(i)) {
             const { x, y, z } = coordFromIdx(i);
             const pos = voxelWorldPos(x, y, z);
-            mesh.position.set(pos.x, pos.y + Math.sin(time * 3) * 0.15, pos.z);
+            dummyMatrix.compose(
+                new THREE.Vector3(pos.x, pos.y + Math.sin(time * 3) * 0.15, pos.z),
+                new THREE.Quaternion(),
+                new THREE.Vector3(1.15, 1.15, 1.15)
+            );
+            voxelMesh.setMatrixAt(i, dummyMatrix);
+            instancesDirty = true;
         }
     });
 
     supportPoints.forEach(i => {
-        const mesh = voxelMeshes[i];
-        if (mesh) {
+        if (voxelExists[i] || supportPoints.has(i)) {
+            const pulse = 1 + Math.sin(time * 2) * 0.05;
             const { x, y, z } = coordFromIdx(i);
             const pos = voxelWorldPos(x, y, z);
-            const pulse = 1 + Math.sin(time * 2) * 0.05;
-            mesh.scale.setScalar(1.15 * pulse);
+            dummyMatrix.compose(
+                new THREE.Vector3(pos.x, pos.y, pos.z),
+                new THREE.Quaternion(),
+                new THREE.Vector3(1.15 * pulse, 1.15 * pulse, 1.15 * pulse)
+            );
+            voxelMesh.setMatrixAt(i, dummyMatrix);
+            instancesDirty = true;
         }
     });
 

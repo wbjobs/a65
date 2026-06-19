@@ -10,106 +10,235 @@ import (
 	"net/http"
 	"structure-generator/beso"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 4096,
+	ReadBufferSize:  65536,
+	WriteBufferSize: 65536,
 	CheckOrigin: func(r *http.Request) bool {
 		return true
 	},
 }
 
-type Client struct {
-	conn  *websocket.Conn
-	grid  *beso.Grid
-	mu    sync.Mutex
-	er    float64
-	ar    float64
-}
-
 type Message struct {
-	Type    string      `json:"type"`
-	Payload interface{} `json:"payload"`
+	Type    string      `json:"type" msgpack:"t"`
+	Payload interface{} `json:"payload" msgpack:"p"`
 }
 
-type PointPayload struct {
-	X int `json:"x"`
-	Y int `json:"y"`
-	Z int `json:"z"`
+type StatePayload struct {
+	Iteration    int     `json:"iteration" msgpack:"i"`
+	VolumeRatio  float64 `json:"volumeRatio" msgpack:"vr"`
+	TargetVolume float64 `json:"targetVolume" msgpack:"tv"`
+	LoadCount    int     `json:"loadCount" msgpack:"lc"`
+	SupportCount int     `json:"supportCount" msgpack:"sc"`
+	IsConverged  bool    `json:"isConverged" msgpack:"ic"`
 }
 
-type ConfigPayload struct {
-	TargetVolume float64 `json:"targetVolume"`
+type IterationPayload struct {
+	Iteration    int     `json:"iteration" msgpack:"i"`
+	VolumeRatio  float64 `json:"volumeRatio" msgpack:"vr"`
+	TargetVolume float64 `json:"targetVolume" msgpack:"tv"`
+	ChangesCount int     `json:"changesCount" msgpack:"cc"`
+	IsConverged  bool    `json:"isConverged" msgpack:"ic"`
+}
+
+type VoxelChangeCompact struct {
+	Index  uint16 `msgpack:"i"`
+	Action uint8  `msgpack:"a"`
+	Stress uint8  `msgpack:"s"`
+}
+
+type Client struct {
+	conn        *websocket.Conn
+	grid        *beso.Grid
+	mu          sync.Mutex
+	sendMu      sync.Mutex
+	er          float64
+	ar          float64
+	sendQueue   chan outboundMessage
+	done        chan struct{}
+	wg          sync.WaitGroup
+	lastSend    time.Time
+	sendThrottle time.Duration
+	pendingMsgs int
+	maxPending  int
+	isClosed    bool
+}
+
+type outboundMessage struct {
+	msgType int
+	data    []byte
 }
 
 const (
-	GRID_SIZE = 20
+	GRID_SIZE     = 20
+	MSG_JSON      = 0
+	MSG_MSGPACK   = 1
+	BIN_FULL      = 1
+	BIN_CHANGES   = 2
+	BIN_STATE     = 3
+	BIN_ITER      = 4
+	MAX_QUEUE     = 50
+	SEND_THROTTLE = 16 * time.Millisecond
 )
 
 func NewClient(conn *websocket.Conn) *Client {
 	return &Client{
-		conn: conn,
-		grid: beso.NewGrid(GRID_SIZE, GRID_SIZE, GRID_SIZE),
-		er:   0.05,
-		ar:   0.05,
+		conn:         conn,
+		grid:         beso.NewGrid(GRID_SIZE, GRID_SIZE, GRID_SIZE),
+		er:           0.05,
+		ar:           0.05,
+		sendQueue:    make(chan outboundMessage, MAX_QUEUE),
+		done:         make(chan struct{}),
+		sendThrottle: SEND_THROTTLE,
+		maxPending:   MAX_QUEUE,
 	}
 }
 
-func (c *Client) SendJSON(msg Message) error {
+func (c *Client) Start() {
+	c.wg.Add(1)
+	go c.sendLoop()
+}
+
+func (c *Client) sendLoop() {
+	defer c.wg.Done()
+	ticker := time.NewTicker(c.sendThrottle)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-ticker.C:
+			c.processQueue()
+		}
+	}
+}
+
+func (c *Client) processQueue() {
+	for {
+		select {
+		case msg := <-c.sendQueue:
+			c.mu.Lock()
+			if c.isClosed {
+				c.mu.Unlock()
+				return
+			}
+			c.mu.Unlock()
+
+			c.sendMu.Lock()
+			err := c.conn.WriteMessage(msg.msgType, msg.data)
+			c.sendMu.Unlock()
+
+			c.mu.Lock()
+			c.pendingMsgs--
+			c.mu.Unlock()
+
+			if err != nil {
+				log.Printf("Write error: %v, closing connection", err)
+				c.Close()
+				return
+			}
+		default:
+			return
+		}
+	}
+}
+
+func (c *Client) enqueueMessage(msgType int, data []byte) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	data, err := json.Marshal(msg)
-	if err != nil {
-		return err
+
+	if c.isClosed {
+		return false
 	}
-	return c.conn.WriteMessage(websocket.TextMessage, data)
+
+	if c.pendingMsgs >= c.maxPending {
+		log.Printf("Queue overflow (%d), dropping message", c.pendingMsgs)
+		return false
+	}
+
+	select {
+	case c.sendQueue <- outboundMessage{msgType: msgType, data: data}:
+		c.pendingMsgs++
+		return true
+	default:
+		log.Printf("Queue full, dropping message")
+		return false
+	}
 }
 
-func encodeVoxelChangesBinary(changes []beso.VoxelChange) ([]byte, error) {
-	var buf bytes.Buffer
-	gzWriter := gzip.NewWriter(&buf)
+func (c *Client) Close() {
+	c.mu.Lock()
+	if c.isClosed {
+		c.mu.Unlock()
+		return
+	}
+	c.isClosed = true
+	close(c.done)
+	c.mu.Unlock()
 
-	count := len(changes)
-	header := make([]byte, 4)
-	binary.LittleEndian.PutUint32(header, uint32(count))
-	if _, err := gzWriter.Write(header); err != nil {
+	c.sendMu.Lock()
+	c.conn.Close()
+	c.sendMu.Unlock()
+
+	c.wg.Wait()
+}
+
+func encodeVoxelChangesMsgPack(changes []beso.VoxelChange) ([]byte, error) {
+	compact := make([]VoxelChangeCompact, len(changes))
+	for i, ch := range changes {
+		compact[i] = VoxelChangeCompact{
+			Index:  uint16(ch.Index),
+			Action: uint8(ch.Action),
+			Stress: uint8(min(max(ch.Stress*255, 0), 255)),
+		}
+	}
+
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	enc := msgpack.NewEncoder(gz)
+	if err := enc.Encode(compact); err != nil {
 		return nil, err
 	}
-
-	for _, ch := range changes {
-		record := make([]byte, 10)
-		binary.LittleEndian.PutUint16(record[0:2], uint16(ch.Index))
-		binary.LittleEndian.PutUint16(record[2:4], uint16(ch.X))
-		binary.LittleEndian.PutUint16(record[4:6], uint16(ch.Y))
-		binary.LittleEndian.PutUint16(record[6:8], uint16(ch.Z))
-		record[8] = ch.Action
-
-		stressByte := byte(0)
-		if ch.Stress >= 0 {
-			s := ch.Stress
-			if s > 1.0 {
-				s = 1.0
-			}
-			stressByte = byte(s * 255.0)
-		}
-		record[9] = stressByte
-
-		if _, err := gzWriter.Write(record); err != nil {
-			return nil, err
-		}
-	}
-
-	if err := gzWriter.Close(); err != nil {
+	if err := gz.Close(); err != nil {
 		return nil, err
 	}
 
 	return buf.Bytes(), nil
 }
 
-func encodeFullGridBinary(grid *beso.Grid) ([]byte, error) {
+func encodeStateMsgPack(sp *StatePayload) ([]byte, error) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	enc := msgpack.NewEncoder(gz)
+	if err := enc.Encode(sp); err != nil {
+		return nil, err
+	}
+	if err := gz.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func encodeIterationMsgPack(ip *IterationPayload) ([]byte, error) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	enc := msgpack.NewEncoder(gz)
+	if err := enc.Encode(ip); err != nil {
+		return nil, err
+	}
+	if err := gz.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func encodeFullGridBinaryCompact(grid *beso.Grid) ([]byte, error) {
 	var buf bytes.Buffer
 	gzWriter := gzip.NewWriter(&buf)
 
@@ -151,24 +280,27 @@ func encodeFullGridBinary(grid *beso.Grid) ([]byte, error) {
 		return nil, err
 	}
 
-	loadCount := len(grid.LoadPoints)
-	loadBuf := make([]byte, 4+loadCount*2)
-	binary.LittleEndian.PutUint32(loadBuf[0:4], uint32(loadCount))
-	for i, idx := range grid.LoadPoints {
-		binary.LittleEndian.PutUint16(loadBuf[4+i*2:6+i*2], uint16(idx))
-	}
-	if _, err := gzWriter.Write(loadBuf); err != nil {
+	metaBuf := make([]byte, 8)
+	binary.LittleEndian.PutUint32(metaBuf[0:4], uint32(len(grid.LoadPoints)))
+	binary.LittleEndian.PutUint32(metaBuf[4:8], uint32(len(grid.SupportPoints)))
+	if _, err := gzWriter.Write(metaBuf); err != nil {
 		return nil, err
 	}
 
-	supportCount := len(grid.SupportPoints)
-	supportBuf := make([]byte, 4+supportCount*2)
-	binary.LittleEndian.PutUint32(supportBuf[0:4], uint32(supportCount))
-	for i, idx := range grid.SupportPoints {
-		binary.LittleEndian.PutUint16(supportBuf[4+i*2:6+i*2], uint16(idx))
+	for _, idx := range grid.LoadPoints {
+		idxBuf := make([]byte, 2)
+		binary.LittleEndian.PutUint16(idxBuf, uint16(idx))
+		if _, err := gzWriter.Write(idxBuf); err != nil {
+			return nil, err
+		}
 	}
-	if _, err := gzWriter.Write(supportBuf); err != nil {
-		return nil, err
+
+	for _, idx := range grid.SupportPoints {
+		idxBuf := make([]byte, 2)
+		binary.LittleEndian.PutUint16(idxBuf, uint16(idx))
+		if _, err := gzWriter.Write(idxBuf); err != nil {
+			return nil, err
+		}
 	}
 
 	if err := gzWriter.Close(); err != nil {
@@ -178,63 +310,73 @@ func encodeFullGridBinary(grid *beso.Grid) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func (c *Client) SendBinary(msgType byte, data []byte) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	frame := append([]byte{msgType}, data...)
-	return c.conn.WriteMessage(websocket.BinaryMessage, frame)
-}
-
-const (
-	BIN_MSG_FULL_GRID     = 1
-	BIN_MSG_VOXEL_CHANGES = 2
-)
-
 func (c *Client) sendFullState() error {
 	c.grid.ComputeStress()
 
-	data, err := encodeFullGridBinary(c.grid)
+	data, err := encodeFullGridBinaryCompact(c.grid)
 	if err != nil {
 		return err
 	}
 
-	if err := c.SendBinary(BIN_MSG_FULL_GRID, data); err != nil {
+	frame := append([]byte{BIN_FULL}, data...)
+	c.enqueueMessage(websocket.BinaryMessage, frame)
+
+	sp := &StatePayload{
+		Iteration:    c.grid.Iteration,
+		VolumeRatio:  c.grid.GetVolumeRatio(),
+		TargetVolume: c.grid.TargetVolumeRatio,
+		LoadCount:    len(c.grid.LoadPoints),
+		SupportCount: len(c.grid.SupportPoints),
+		IsConverged:  c.grid.IsConverged(),
+	}
+
+	stateData, err := encodeStateMsgPack(sp)
+	if err != nil {
 		return err
 	}
 
-	return c.SendJSON(Message{
-		Type: "state",
-		Payload: map[string]interface{}{
-			"iteration":     c.grid.Iteration,
-			"volumeRatio":   c.grid.GetVolumeRatio(),
-			"targetVolume":  c.grid.TargetVolumeRatio,
-			"loadCount":     len(c.grid.LoadPoints),
-			"supportCount":  len(c.grid.SupportPoints),
-			"isConverged":   c.grid.IsConverged(),
-		},
-	})
+	stateFrame := append([]byte{BIN_STATE}, stateData...)
+	c.enqueueMessage(websocket.BinaryMessage, stateFrame)
+
+	return nil
 }
 
 func (c *Client) sendIterationResult(changes []beso.VoxelChange) error {
-	data, err := encodeVoxelChangesBinary(changes)
+	data, err := encodeVoxelChangesMsgPack(changes)
 	if err != nil {
 		return err
 	}
 
-	if err := c.SendBinary(BIN_MSG_VOXEL_CHANGES, data); err != nil {
+	frame := append([]byte{BIN_CHANGES}, data...)
+	c.enqueueMessage(websocket.BinaryMessage, frame)
+
+	ip := &IterationPayload{
+		Iteration:    c.grid.Iteration,
+		VolumeRatio:  c.grid.GetVolumeRatio(),
+		TargetVolume: c.grid.TargetVolumeRatio,
+		ChangesCount: len(changes),
+		IsConverged:  c.grid.IsConverged(),
+	}
+
+	iterData, err := encodeIterationMsgPack(ip)
+	if err != nil {
 		return err
 	}
 
-	return c.SendJSON(Message{
-		Type: "iteration",
-		Payload: map[string]interface{}{
-			"iteration":     c.grid.Iteration,
-			"volumeRatio":   c.grid.GetVolumeRatio(),
-			"targetVolume":  c.grid.TargetVolumeRatio,
-			"changesCount":  len(changes),
-			"isConverged":   c.grid.IsConverged(),
-		},
-	})
+	iterFrame := append([]byte{BIN_ITER}, iterData...)
+	c.enqueueMessage(websocket.BinaryMessage, iterFrame)
+
+	return nil
+}
+
+type PointPayload struct {
+	X int `json:"x" msgpack:"x"`
+	Y int `json:"y" msgpack:"y"`
+	Z int `json:"z" msgpack:"z"`
+}
+
+type ConfigPayload struct {
+	TargetVolume float64 `json:"targetVolume" msgpack:"tv"`
 }
 
 func (c *Client) handleMessage(msgType int, data []byte) {
@@ -244,92 +386,153 @@ func (c *Client) handleMessage(msgType int, data []byte) {
 			log.Printf("JSON parse error: %v", err)
 			return
 		}
+		c.processCommand(msg.Type, msg.Payload)
+	} else if msgType == websocket.BinaryMessage {
+		if len(data) < 1 {
+			return
+		}
+		msgTypeByte := data[0]
+		payload := data[1:]
 
-		switch msg.Type {
-		case "setLoad":
-			var p PointPayload
-			if payload, ok := msg.Payload.(map[string]interface{}); ok {
-				p.X = int(payload["x"].(float64))
-				p.Y = int(payload["y"].(float64))
-				p.Z = int(payload["z"].(float64))
+		if msgTypeByte == MSG_MSGPACK {
+			var msg Message
+			if err := msgpack.Unmarshal(payload, &msg); err != nil {
+				log.Printf("MsgPack parse error: %v", err)
+				return
 			}
-			c.grid.SetLoad(p.X, p.Y, p.Z)
-			c.sendFullState()
-
-		case "setSupport":
-			var p PointPayload
-			if payload, ok := msg.Payload.(map[string]interface{}); ok {
-				p.X = int(payload["x"].(float64))
-				p.Y = int(payload["y"].(float64))
-				p.Z = int(payload["z"].(float64))
-			}
-			c.grid.SetSupport(p.X, p.Y, p.Z)
-			c.sendFullState()
-
-		case "removeLoad":
-			var p PointPayload
-			if payload, ok := msg.Payload.(map[string]interface{}); ok {
-				p.X = int(payload["x"].(float64))
-				p.Y = int(payload["y"].(float64))
-				p.Z = int(payload["z"].(float64))
-			}
-			c.grid.RemoveLoad(p.X, p.Y, p.Z)
-			c.sendFullState()
-
-		case "removeSupport":
-			var p PointPayload
-			if payload, ok := msg.Payload.(map[string]interface{}); ok {
-				p.X = int(payload["x"].(float64))
-				p.Y = int(payload["y"].(float64))
-				p.Z = int(payload["z"].(float64))
-			}
-			c.grid.RemoveSupport(p.X, p.Y, p.Z)
-			c.sendFullState()
-
-		case "setConfig":
-			if payload, ok := msg.Payload.(map[string]interface{}); ok {
-				if tv, ok := payload["targetVolume"].(float64); ok {
-					c.grid.TargetVolumeRatio = tv
-				}
-			}
-			c.sendFullState()
-
-		case "iterate":
-			changes := c.grid.Evolve(c.er, c.ar)
-			c.sendIterationResult(changes)
-
-		case "iterateAll":
-			go func() {
-				for !c.grid.IsConverged() {
-					changes := c.grid.Evolve(c.er, c.ar)
-					c.sendIterationResult(changes)
-				}
-				c.SendJSON(Message{
-					Type: "done",
-					Payload: map[string]interface{}{
-						"iteration":   c.grid.Iteration,
-						"volumeRatio": c.grid.GetVolumeRatio(),
-					},
-				})
-			}()
-
-		case "reset":
-			c.grid.Reset()
-			c.sendFullState()
-
-		case "getState":
-			c.sendFullState()
+			c.processCommand(msg.Type, msg.Payload)
 		}
 	}
 }
 
-func (c *Client) Run() {
-	defer c.conn.Close()
+func (c *Client) processCommand(cmdType string, payload interface{}) {
+	switch cmdType {
+	case "setLoad":
+		p := parsePointPayload(payload)
+		c.grid.SetLoad(p.X, p.Y, p.Z)
+		c.sendFullState()
 
+	case "setSupport":
+		p := parsePointPayload(payload)
+		c.grid.SetSupport(p.X, p.Y, p.Z)
+		c.sendFullState()
+
+	case "removeLoad":
+		p := parsePointPayload(payload)
+		c.grid.RemoveLoad(p.X, p.Y, p.Z)
+		c.sendFullState()
+
+	case "removeSupport":
+		p := parsePointPayload(payload)
+		c.grid.RemoveSupport(p.X, p.Y, p.Z)
+		c.sendFullState()
+
+	case "setConfig":
+		if p, ok := payload.(map[string]interface{}); ok {
+			if tv, ok := p["targetVolume"].(float64); ok {
+				c.grid.TargetVolumeRatio = tv
+			}
+			if tv, ok := p["tv"].(float64); ok {
+				c.grid.TargetVolumeRatio = tv
+			}
+		}
+		c.sendFullState()
+
+	case "iterate":
+		changes := c.grid.Evolve(c.er, c.ar)
+		c.sendIterationResult(changes)
+
+	case "iterateAll":
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("IterateAll panic recovered: %v", r)
+				}
+			}()
+
+			throttle := time.NewTicker(32 * time.Millisecond)
+			defer throttle.Stop()
+
+			for !c.grid.IsConverged() {
+				<-throttle.C
+
+				c.mu.Lock()
+				closed := c.isClosed
+				queueFull := c.pendingMsgs >= c.maxPending-5
+				c.mu.Unlock()
+
+				if closed {
+					return
+				}
+				if queueFull {
+					time.Sleep(50 * time.Millisecond)
+					continue
+				}
+
+				changes := c.grid.Evolve(c.er, c.ar)
+				c.sendIterationResult(changes)
+
+				if c.grid.Iteration%50 == 0 {
+					log.Printf("Iteration %d, volume: %.2f%%, pending: %d",
+						c.grid.Iteration, c.grid.GetVolumeRatio()*100, c.pendingMsgs)
+				}
+			}
+
+			doneData, _ := json.Marshal(Message{
+				Type: "done",
+				Payload: map[string]interface{}{
+					"iteration":   c.grid.Iteration,
+					"volumeRatio": c.grid.GetVolumeRatio(),
+				},
+			})
+			c.enqueueMessage(websocket.TextMessage, doneData)
+		}()
+
+	case "reset":
+		c.grid.Reset()
+		c.sendFullState()
+
+	case "getState":
+		c.sendFullState()
+	}
+}
+
+func parsePointPayload(payload interface{}) PointPayload {
+	var p PointPayload
+	if m, ok := payload.(map[string]interface{}); ok {
+		if x, ok := m["x"].(float64); ok {
+			p.X = int(x)
+		}
+		if y, ok := m["y"].(float64); ok {
+			p.Y = int(y)
+		}
+		if z, ok := m["z"].(float64); ok {
+			p.Z = int(z)
+		}
+		if x, ok := m["x"].(int8); ok {
+			p.X = int(x)
+		}
+		if y, ok := m["y"].(int8); ok {
+			p.Y = int(y)
+		}
+		if z, ok := m["z"].(int8); ok {
+			p.Z = int(z)
+		}
+	}
+	return p
+}
+
+func (c *Client) Run() {
+	defer c.Close()
+
+	c.Start()
 	c.sendFullState()
 
+	conn := c.conn
+	conn.SetReadLimit(1024 * 1024)
+
 	for {
-		msgType, data, err := c.conn.ReadMessage()
+		msgType, data, err := conn.ReadMessage()
 		if err != nil {
 			if err != io.EOF {
 				log.Printf("Read error: %v", err)
@@ -347,10 +550,14 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	conn.SetPingHandler(func(appData string) error {
+		return nil
+	})
+
 	client := NewClient(conn)
 	log.Printf("Client connected from %s", conn.RemoteAddr())
 	client.Run()
-	log.Printf("Client disconnected")
+	log.Printf("Client disconnected, iterations: %d", client.grid.Iteration)
 }
 
 func main() {
@@ -362,5 +569,20 @@ func main() {
 	log.Println("Server starting on :8081")
 	log.Println("Frontend: http://localhost:8081")
 	log.Println("WebSocket: ws://localhost:8081/ws")
+	log.Println("Optimizations: MessagePack, queue throttling, backpressure control")
 	log.Fatal(http.ListenAndServe(":8081", nil))
+}
+
+func min(a, b float64) float64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
 }
