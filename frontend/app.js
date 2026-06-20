@@ -6,25 +6,32 @@ const VOXEL_SIZE = 1;
 const GAP = 0.05;
 const TOTAL_VOXELS = GRID_SIZE * GRID_SIZE * GRID_SIZE;
 
+const FATIGUE_WARNING = 0.4;
+const FATIGUE_LIMIT = 0.7;
+
 let scene, camera, renderer, controls;
 let voxelMesh;
 let dummyMatrix;
 let voxelExists = new Uint8Array(TOTAL_VOXELS);
 let voxelStress = new Float32Array(TOTAL_VOXELS);
+let voxelFatigue = new Float32Array(TOTAL_VOXELS);
 let loadPoints = new Set();
 let supportPoints = new Set();
 let raycaster, mouse;
 let hoverIndicator;
-let loadMarkers = [];
-let supportMarkers = [];
 
 let instancesDirty = true;
 let colorsDirty = true;
 
 let currentTool = 'load';
 let isOptimizing = false;
+let isDynamicRunning = false;
 let ws = null;
 let isConnected = false;
+
+let currentTimeStep = 0;
+let currentTime = 0;
+let currentLoadValue = 1.0;
 
 function idx(x, y, z) {
     return x + y * GRID_SIZE + z * GRID_SIZE * GRID_SIZE;
@@ -37,9 +44,26 @@ function coordFromIdx(i) {
     return { x, y, z };
 }
 
-function stressToColor(stress, isLoad, isSupport) {
+function voxelToColor(stress, fatigue, isLoad, isSupport) {
     if (isLoad) return new THREE.Color(0xff6b6b);
     if (isSupport) return new THREE.Color(0x00d9ff);
+
+    if (fatigue >= FATIGUE_LIMIT) {
+        const t = (fatigue - FATIGUE_LIMIT) / (1.0 - FATIGUE_LIMIT);
+        return new THREE.Color().lerpColors(
+            new THREE.Color(0xff6b6b),
+            new THREE.Color(0x8b0000),
+            Math.min(1, t)
+        );
+    } else if (fatigue >= FATIGUE_WARNING) {
+        const t = (fatigue - FATIGUE_WARNING) / (FATIGUE_LIMIT - FATIGUE_WARNING);
+        return new THREE.Color().lerpColors(
+            new THREE.Color(0xff9f43),
+            new THREE.Color(0xff6b6b),
+            t
+        );
+    }
+
     const s = Math.max(0, Math.min(1, stress));
     const r = Math.min(1, s * 2);
     const g = Math.min(1, 2 - s * 2);
@@ -181,9 +205,6 @@ function createInstancedVoxels() {
 
     voxelMesh.userData.voxelIndices = new Array(TOTAL_VOXELS);
 
-    const identityMatrix = new THREE.Matrix4();
-    const hiddenMatrix = new THREE.Matrix4().makeScale(0, 0, 0);
-
     for (let i = 0; i < TOTAL_VOXELS; i++) {
         const { x, y, z } = coordFromIdx(i);
         const pos = voxelWorldPos(x, y, z);
@@ -235,7 +256,7 @@ function updateVoxelInstance(i) {
         );
         voxelMesh.setMatrixAt(i, dummyMatrix);
 
-        const color = stressToColor(voxelStress[i], isLoad, isSupport);
+        const color = voxelToColor(voxelStress[i], voxelFatigue[i], isLoad, isSupport);
         voxelMesh.setColorAt(i, color);
     } else {
         dummyMatrix.makeScale(0, 0, 0);
@@ -247,7 +268,6 @@ function updateVoxelInstance(i) {
 
 function updateAllInstances() {
     const hiddenMatrix = new THREE.Matrix4().makeScale(0, 0, 0);
-    const color = new THREE.Color();
 
     for (let i = 0; i < TOTAL_VOXELS; i++) {
         const exists = voxelExists[i];
@@ -265,8 +285,8 @@ function updateAllInstances() {
             );
             voxelMesh.setMatrixAt(i, dummyMatrix);
 
-            const c = stressToColor(voxelStress[i], isLoad, isSupport);
-            voxelMesh.setColorAt(i, c);
+            const color = voxelToColor(voxelStress[i], voxelFatigue[i], isLoad, isSupport);
+            voxelMesh.setColorAt(i, color);
         } else {
             voxelMesh.setMatrixAt(i, hiddenMatrix);
         }
@@ -374,16 +394,57 @@ function setupUI() {
         sendMessage('setConfig', { targetVolume: val / 100 });
     });
 
+    const freqSlider = document.getElementById('freq-slider');
+    const freqValue = document.getElementById('freq-value');
+    freqSlider.addEventListener('input', () => {
+        const val = parseFloat(freqSlider.value);
+        freqValue.textContent = val.toFixed(1);
+        sendDynamicParams();
+    });
+
+    const ampSlider = document.getElementById('amp-slider');
+    const ampValue = document.getElementById('amp-value');
+    ampSlider.addEventListener('input', () => {
+        const val = parseFloat(ampSlider.value);
+        ampValue.textContent = val.toFixed(1);
+        sendDynamicParams();
+    });
+
     document.getElementById('start-btn').addEventListener('click', () => {
         if (!isConnected || loadPoints.size === 0 || supportPoints.size === 0) {
             alert('请先连接服务器并放置至少一个受力点和一个支撑点！');
             return;
         }
-        if (!isOptimizing) {
+        if (!isOptimizing && !isDynamicRunning) {
             isOptimizing = true;
             document.getElementById('start-btn').textContent = '⏸ 优化中...';
             document.getElementById('start-btn').disabled = true;
             sendMessage('iterateAll', {});
+        }
+    });
+
+    document.getElementById('dynamic-btn').addEventListener('click', () => {
+        if (!isConnected || loadPoints.size === 0 || supportPoints.size === 0) {
+            alert('请先连接服务器并放置至少一个受力点和一个支撑点！');
+            return;
+        }
+        if (!isDynamicRunning) {
+            sendDynamicParams();
+            setTimeout(() => {
+                isDynamicRunning = true;
+                isOptimizing = true;
+                document.getElementById('dynamic-btn').classList.add('active');
+                document.getElementById('dynamic-btn').textContent = '⏸ 动态优化中...';
+                document.getElementById('start-btn').disabled = true;
+                sendMessage('startDynamic', {});
+            }, 100);
+        } else {
+            isDynamicRunning = false;
+            isOptimizing = false;
+            document.getElementById('dynamic-btn').classList.remove('active');
+            document.getElementById('dynamic-btn').textContent = '↻ 动态优化';
+            document.getElementById('start-btn').disabled = false;
+            sendMessage('stopDynamic', {});
         }
     });
 
@@ -395,17 +456,41 @@ function setupUI() {
         sendMessage('iterate', {});
     });
 
+    document.getElementById('step-time-btn').addEventListener('click', () => {
+        if (!isConnected || loadPoints.size === 0 || supportPoints.size === 0) {
+            alert('请先连接服务器并放置至少一个受力点和一个支撑点！');
+            return;
+        }
+        sendMessage('stepTime', {});
+    });
+
     document.getElementById('reset-btn').addEventListener('click', () => {
         isOptimizing = false;
-        document.getElementById('start-btn').textContent = '▶ 开始优化';
+        isDynamicRunning = false;
+        document.getElementById('start-btn').textContent = '▶ 静态优化';
         document.getElementById('start-btn').disabled = false;
+        document.getElementById('dynamic-btn').classList.remove('active');
+        document.getElementById('dynamic-btn').textContent = '↻ 动态优化';
         loadPoints.clear();
         supportPoints.clear();
         voxelExists.fill(1);
         voxelStress.fill(0);
+        voxelFatigue.fill(0);
+        currentTimeStep = 0;
+        currentTime = 0;
         updateAllInstances();
         updateStatusUI();
         sendMessage('reset', {});
+    });
+}
+
+function sendDynamicParams() {
+    const freq = parseFloat(document.getElementById('freq-slider').value);
+    const amp = parseFloat(document.getElementById('amp-slider').value);
+    sendMessage('setDynamicParams', {
+        frequency: freq,
+        amplitude: amp,
+        enabled: true
     });
 }
 
@@ -414,22 +499,59 @@ function updateStatusUI(data) {
     document.getElementById('conn-status').style.color = isConnected ? '#00ff88' : '#ff6b6b';
     document.getElementById('load-count').textContent = loadPoints.size;
     document.getElementById('support-count').textContent = supportPoints.size;
+    document.getElementById('time-step').textContent = currentTimeStep;
 
     if (data) {
-        document.getElementById('iter-count').textContent = data.i || data.iteration || 0;
-        const volPercent = Math.round((data.vr || data.volumeRatio || 1) * 100);
+        const iter = data.i !== undefined ? data.i : (data.iteration || 0);
+        document.getElementById('iter-count').textContent = iter;
+
+        const volPercent = Math.round((data.vr !== undefined ? data.vr : (data.volumeRatio || 1)) * 100);
         document.getElementById('current-vol').textContent = volPercent + '%';
-        const targetVol = data.tv || data.targetVolume || 0.4;
-        const currentVol = data.vr || data.volumeRatio || 1;
+
+        const targetVol = data.tv !== undefined ? data.tv : (data.targetVolume || 0.4);
+        const currentVol = data.vr !== undefined ? data.vr : (data.volumeRatio || 1);
         const progress = currentVol > targetVol
             ? Math.min(100, ((1 - currentVol) / (1 - targetVol)) * 100)
             : 100;
         document.getElementById('progress-fill').style.width = progress + '%';
 
-        if (data.ic || data.isConverged) {
+        if (data.ts !== undefined) {
+            currentTimeStep = data.ts;
+            document.getElementById('time-step').textContent = currentTimeStep;
+        }
+        if (data.t !== undefined) {
+            currentTime = data.t;
+        }
+        if (data.clv !== undefined) {
+            currentLoadValue = data.clv;
+            const loadPercent = ((currentLoadValue + 2) / 4) * 100;
+            document.getElementById('load-fill').style.width = Math.max(0, Math.min(100, loadPercent)) + '%';
+        }
+
+        const fwc = data.fwc !== undefined ? data.fwc : (data.fatigueWarningCount || 0);
+        const warnEl = document.getElementById('fatigue-warn');
+        warnEl.textContent = fwc;
+        warnEl.className = 'value' + (fwc > 0 ? ' warning' : '');
+
+        const fcc = data.fcc !== undefined ? data.fcc : (data.fatigueCriticalCount || 0);
+        const dangerEl = document.getElementById('fatigue-danger');
+        dangerEl.textContent = fcc;
+        dangerEl.className = 'value' + (fcc > 0 ? ' danger' : '');
+
+        const mfd = data.mfd !== undefined ? data.mfd : (data.maxFatigueDamage || 0);
+        document.getElementById('max-fatigue').textContent = Math.round(mfd * 100) + '%';
+
+        const udl = data.udl !== undefined ? data.udl : (data.useDynamicLoad || false);
+        if (udl !== undefined && !isDynamicRunning && !isOptimizing) {
+        }
+
+        if (data.ic !== undefined ? data.ic : data.isConverged) {
             isOptimizing = false;
+            isDynamicRunning = false;
             document.getElementById('start-btn').textContent = '✓ 完成';
             document.getElementById('start-btn').disabled = false;
+            document.getElementById('dynamic-btn').classList.remove('active');
+            document.getElementById('dynamic-btn').textContent = '↻ 动态优化';
         }
     }
 }
@@ -450,8 +572,11 @@ function connectWebSocket() {
     ws.onclose = () => {
         isConnected = false;
         isOptimizing = false;
-        document.getElementById('start-btn').textContent = '▶ 开始优化';
+        isDynamicRunning = false;
+        document.getElementById('start-btn').textContent = '▶ 静态优化';
         document.getElementById('start-btn').disabled = false;
+        document.getElementById('dynamic-btn').classList.remove('active');
+        document.getElementById('dynamic-btn').textContent = '↻ 动态优化';
         updateStatusUI();
         console.log('WebSocket disconnected, reconnecting in 3s...');
         setTimeout(connectWebSocket, 3000);
@@ -474,12 +599,13 @@ async function handleBinaryMessage(buffer) {
     const data = new Uint8Array(buffer);
     const msgType = data[0];
     const payload = new Uint8Array(buffer, 1);
+    const payloadBuf = payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength);
 
     if (msgType === 1) {
-        await decodeFullGrid(payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength));
+        await decodeFullGrid(payloadBuf);
     } else if (msgType === 2) {
-        await decodeVoxelChanges(payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength));
-    } else if (msgType === 3 || msgType === 4) {
+        await decodeVoxelChanges(payloadBuf);
+    } else if (msgType === 3 || msgType === 4 || msgType === 5) {
         try {
             const decompressed = await decompressGzip(payload);
             const state = await decodeMessagePack(decompressed);
@@ -514,6 +640,11 @@ async function decodeFullGrid(buffer) {
     }
     offset += total;
 
+    for (let i = 0; i < total; i++) {
+        voxelFatigue[i] = data[offset + i] / 255.0;
+    }
+    offset += total;
+
     loadPoints.clear();
     const loadCount = view.getUint32(offset, true); offset += 4;
     const supportCount = view.getUint32(offset, true); offset += 4;
@@ -539,9 +670,10 @@ async function decodeVoxelChanges(buffer) {
 
         if (Array.isArray(changes)) {
             for (const ch of changes) {
-                const index = ch.i || ch.index;
-                const action = ch.a || ch.action;
-                const stress = (ch.s || ch.stress || 0) / 255.0;
+                const index = ch.i !== undefined ? ch.i : ch.index;
+                const action = ch.a !== undefined ? ch.a : ch.action;
+                const stress = ((ch.s !== undefined ? ch.s : ch.stress) || 0) / 255.0;
+                const fatigue = ((ch.f !== undefined ? ch.f : ch.fatigueDamage) || 0) / 255.0;
 
                 if (action === 1) {
                     voxelExists[index] = 1;
@@ -549,6 +681,7 @@ async function decodeVoxelChanges(buffer) {
                     voxelExists[index] = 0;
                 }
                 voxelStress[index] = stress;
+                voxelFatigue[index] = fatigue;
                 updateVoxelInstance(index);
             }
         }
@@ -593,8 +726,9 @@ function animate() {
         if (voxelExists[i] || loadPoints.has(i)) {
             const { x, y, z } = coordFromIdx(i);
             const pos = voxelWorldPos(x, y, z);
+            const loadOffset = isDynamicRunning ? Math.sin(currentTime * Math.PI * 2 * (parseFloat(document.getElementById('freq-slider').value) || 1)) * 0.2 : Math.sin(time * 3) * 0.15;
             dummyMatrix.compose(
-                new THREE.Vector3(pos.x, pos.y + Math.sin(time * 3) * 0.15, pos.z),
+                new THREE.Vector3(pos.x, pos.y + loadOffset, pos.z),
                 new THREE.Quaternion(),
                 new THREE.Vector3(1.15, 1.15, 1.15)
             );
@@ -622,3 +756,74 @@ function animate() {
 }
 
 init();
+
+window.__test = {
+    addLoadPoint: (x, y, z) => {
+        sendMessage('setLoad', { x, y, z });
+        loadPoints.add(idx(x, y, z));
+        console.log('Load point added:', x, y, z);
+    },
+    addSupportPoint: (x, y, z) => {
+        sendMessage('setSupport', { x, y, z });
+        supportPoints.add(idx(x, y, z));
+        console.log('Support point added:', x, y, z);
+    },
+    setDynamicParams: (freq, amp) => {
+        sendMessage('setDynamicParams', { frequency: freq, amplitude: amp, enabled: true });
+        console.log('Dynamic params set:', freq, amp);
+    },
+    startDynamic: () => {
+        isDynamicRunning = true;
+        isOptimizing = true;
+        document.getElementById('dynamic-btn').classList.add('active');
+        document.getElementById('dynamic-btn').textContent = '⏸ 动态优化中...';
+        document.getElementById('start-btn').disabled = true;
+        sendMessage('startDynamic', {});
+        console.log('Dynamic optimization started');
+    },
+    stopDynamic: () => {
+        isDynamicRunning = false;
+        isOptimizing = false;
+        document.getElementById('dynamic-btn').classList.remove('active');
+        document.getElementById('dynamic-btn').textContent = '↻ 动态优化';
+        document.getElementById('start-btn').disabled = false;
+        sendMessage('stopDynamic', {});
+        console.log('Dynamic optimization stopped');
+    },
+    stepTime: () => {
+        sendMessage('stepTime', {});
+        console.log('Single time step');
+    },
+    getStatus: () => {
+        const status = {
+            isConnected,
+            isDynamicRunning,
+            currentTimeStep,
+            currentTime,
+            currentLoadValue,
+            loadPointsSize: loadPoints.size,
+            supportPointsSize: supportPoints.size,
+            fatigueWarn: document.getElementById('fatigue-warn').textContent,
+            fatigueDanger: document.getElementById('fatigue-danger').textContent,
+            maxFatigueUI: document.getElementById('max-fatigue').textContent,
+            timeStepUI: document.getElementById('time-step').textContent,
+            iterCountUI: document.getElementById('iter-count').textContent
+        };
+        let maxF = 0, maxS = 0;
+        let warnCount = 0, dangerCount = 0;
+        for (let i = 0; i < voxelFatigue.length; i++) {
+            if (voxelFatigue[i] > maxF) maxF = voxelFatigue[i];
+            if (voxelFatigue[i] >= 0.7) dangerCount++;
+            else if (voxelFatigue[i] >= 0.4) warnCount++;
+        }
+        for (let i = 0; i < voxelStress.length; i++) {
+            if (voxelStress[i] > maxS) maxS = voxelStress[i];
+        }
+        status.maxFatigueInArray = maxF;
+        status.maxStressInArray = maxS;
+        status.warnCount = warnCount;
+        status.dangerCount = dangerCount;
+        console.log('Status:', status);
+        return status;
+    }
+};

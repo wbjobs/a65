@@ -35,6 +35,9 @@
         .control-btn:disabled { background: #233554; color: #555; cursor: not-allowed; transform: none; box-shadow: none; }
         .control-btn.reset { background: linear-gradient(135deg, #ff6b6b, #cc4444); }
         .control-btn.reset:hover { box-shadow: 0 4px 16px rgba(255, 107, 107, 0.4); }
+        .control-btn.dynamic { background: linear-gradient(135deg, #ff9f43, #ee5a24); }
+        .control-btn.dynamic:hover { box-shadow: 0 4px 16px rgba(255, 159, 67, 0.4); }
+        .control-btn.dynamic.active { background: linear-gradient(135deg, #ee5a24, #c0392b); }
         #status {
             margin-top: 16px; padding: 12px; background: rgba(0,0,0,0.3);
             border-radius: 8px; font-size: 12px; line-height: 1.6;
@@ -42,8 +45,29 @@
         #status .item { display: flex; justify-content: space-between; padding: 3px 0; }
         #status .label { color: #8892b0; }
         #status .value { color: #00d9ff; font-weight: 600; }
+        #status .value.warning { color: #ff9f43; }
+        #status .value.danger { color: #ff6b6b; }
         .progress-bar { height: 6px; background: #233554; border-radius: 3px; margin-top: 8px; overflow: hidden; }
         .progress-fill { height: 100%; background: linear-gradient(90deg, #00d9ff, #00ff88); border-radius: 3px; transition: width 0.3s; width: 0%; }
+        .section-divider {
+            height: 1px; background: linear-gradient(90deg, transparent, #233554, transparent);
+            margin: 16px 0;
+        }
+        .load-indicator {
+            width: 100%; height: 20px; background: rgba(0,0,0,0.3); border-radius: 4px;
+            overflow: hidden; position: relative; margin-top: 4px;
+        }
+        .load-indicator-fill {
+            height: 100%; background: linear-gradient(90deg, #00d9ff, #ff9f43, #ff6b6b);
+            transition: width 0.05s; width: 50%;
+        }
+        .fatigue-legend {
+            display: flex; justify-content: space-between; margin-top: 6px; font-size: 10px;
+        }
+        .fatigue-legend span { padding: 2px 6px; border-radius: 3px; }
+        .fatigue-safe { background: rgba(0, 255, 136, 0.2); color: #00ff88; }
+        .fatigue-warn { background: rgba(255, 159, 67, 0.2); color: #ff9f43; }
+        .fatigue-danger { background: rgba(255, 107, 107, 0.2); color: #ff6b6b; }
         #instructions {
             position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
             background: rgba(22, 33, 62, 0.9); color: #8892b0; padding: 12px 24px;
@@ -67,15 +91,41 @@
             <label>目标体积: <span id="volume-value">40</span>%</label>
             <input type="range" id="volume-slider" min="10" max="80" value="40" style="width:100%">
         </div>
-        <button class="control-btn" id="start-btn">▶ 开始优化</button>
+
+        <div class="section-divider"></div>
+
+        <div class="tool-group">
+            <label>动态载荷</label>
+            <label style="text-transform: none; font-size: 11px;">频率: <span id="freq-value">1.0</span> Hz</label>
+            <input type="range" id="freq-slider" min="0.1" max="5.0" step="0.1" value="1.0" style="width:100%">
+            <label style="text-transform: none; font-size: 11px; margin-top: 8px;">振幅: <span id="amp-value">0.5</span></label>
+            <input type="range" id="amp-slider" min="0" max="2.0" step="0.1" value="0.5" style="width:100%">
+            <div class="load-indicator">
+                <div class="load-indicator-fill" id="load-fill"></div>
+            </div>
+            <div class="fatigue-legend">
+                <span class="fatigue-safe">安全</span>
+                <span class="fatigue-warn">警告</span>
+                <span class="fatigue-danger">危险</span>
+            </div>
+        </div>
+
+        <button class="control-btn" id="start-btn">▶ 静态优化</button>
+        <button class="control-btn dynamic" id="dynamic-btn">↻ 动态优化</button>
         <button class="control-btn" id="step-btn">⏭ 单步迭代</button>
+        <button class="control-btn" id="step-time-btn">⏱ 单步时间</button>
         <button class="control-btn reset" id="reset-btn">↺ 重置</button>
+
         <div id="status">
             <div class="item"><span class="label">连接状态:</span><span class="value" id="conn-status">未连接</span></div>
+            <div class="item"><span class="label">时间步:</span><span class="value" id="time-step">0</span></div>
             <div class="item"><span class="label">迭代次数:</span><span class="value" id="iter-count">0</span></div>
             <div class="item"><span class="label">当前体积:</span><span class="value" id="current-vol">100%</span></div>
             <div class="item"><span class="label">受力点:</span><span class="value" id="load-count">0</span></div>
             <div class="item"><span class="label">支撑点:</span><span class="value" id="support-count">0</span></div>
+            <div class="item"><span class="label">疲劳警告:</span><span class="value" id="fatigue-warn">0</span></div>
+            <div class="item"><span class="label">疲劳危险:</span><span class="value danger" id="fatigue-danger">0</span></div>
+            <div class="item"><span class="label">最大疲劳:</span><span class="value" id="max-fatigue">0%</span></div>
             <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
         </div>
     </div>

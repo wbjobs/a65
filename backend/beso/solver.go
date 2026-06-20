@@ -6,10 +6,11 @@ import (
 )
 
 type VoxelChange struct {
-	Index   int
-	X, Y, Z int
-	Action  byte
-	Stress  float64
+	Index         int
+	X, Y, Z      int
+	Action        byte
+	Stress        float64
+	FatigueDamage float64
 }
 
 const (
@@ -17,6 +18,15 @@ const (
 	ActionRemove = 2
 	ActionKeep   = 0
 )
+
+type TimeStepResult struct {
+	TimeStep      int
+	Time          float64
+	StressUpdated bool
+	DidAnalysis   bool
+	Changes       []VoxelChange
+	FatigueUpdated bool
+}
 
 func (g *Grid) getNeighbors(idx int) []int {
 	x, y, z := g.IndexToCoord(idx)
@@ -55,18 +65,49 @@ func (g *Grid) ComputeStress() {
 		g.Voxels[i].Stress = 0
 	}
 
-	if len(g.LoadPoints) == 0 || len(g.SupportPoints) == 0 {
+	if len(g.SupportPoints) == 0 {
 		return
 	}
 
-	for _, loadIdx := range g.LoadPoints {
-		if !g.Voxels[loadIdx].Exists {
-			continue
+	var effectiveLoads []struct {
+		idx       int
+		magnitude float64
+	}
+
+	if g.UseDynamicLoad && len(g.DynamicLoads) > 0 {
+		for _, dl := range g.DynamicLoads {
+			mag := g.GetCurrentLoadMagnitude(&dl)
+			loadPoints := g.GetAffectedLoadPoints(&dl)
+			for _, lp := range loadPoints {
+				if g.Voxels[lp].Exists || g.Voxels[lp].IsLoad {
+					effectiveLoads = append(effectiveLoads, struct {
+						idx       int
+						magnitude float64
+					}{lp, mag})
+				}
+			}
 		}
+	} else {
+		for _, lp := range g.LoadPoints {
+			if g.Voxels[lp].Exists || g.Voxels[lp].IsLoad {
+				effectiveLoads = append(effectiveLoads, struct {
+					idx       int
+					magnitude float64
+				}{lp, 1.0})
+			}
+		}
+	}
+
+	if len(effectiveLoads) == 0 {
+		return
+	}
+
+	for _, load := range effectiveLoads {
+		loadIdx := load.idx
 		lx, ly, lz := g.IndexToCoord(loadIdx)
 
 		for _, supportIdx := range g.SupportPoints {
-			if !g.Voxels[supportIdx].Exists {
+			if !g.Voxels[supportIdx].Exists && !g.Voxels[supportIdx].IsSupport {
 				continue
 			}
 			sx, sy, sz := g.IndexToCoord(supportIdx)
@@ -88,7 +129,7 @@ func (g *Grid) ComputeStress() {
 
 				if g.InBounds(px, py, pz) {
 					idx := g.Index(px, py, pz)
-					if g.Voxels[idx].Exists {
+					if g.Voxels[idx].Exists || g.Voxels[idx].IsLoad || g.Voxels[idx].IsSupport {
 						perpendicularSpread := 1
 						for ox := -perpendicularSpread; ox <= perpendicularSpread; ox++ {
 							for oy := -perpendicularSpread; oy <= perpendicularSpread; oy++ {
@@ -96,10 +137,10 @@ func (g *Grid) ComputeStress() {
 									nx, ny, nz := px+ox, py+oy, pz+oz
 									if g.InBounds(nx, ny, nz) {
 										nidx := g.Index(nx, ny, nz)
-										if g.Voxels[nidx].Exists {
+										if g.Voxels[nidx].Exists || g.Voxels[nidx].IsLoad || g.Voxels[nidx].IsSupport {
 											offDist := math.Sqrt(float64(ox*ox + oy*oy + oz*oz))
 											weight := 1.0 / (1.0 + offDist*2.0)
-											g.Voxels[nidx].Stress += weight / dist
+											g.Voxels[nidx].Stress += weight * load.magnitude / dist
 										}
 									}
 								}
@@ -113,7 +154,7 @@ func (g *Grid) ComputeStress() {
 
 	maxStress := 0.0
 	for i := range g.Voxels {
-		if g.Voxels[i].Exists && g.Voxels[i].Stress > maxStress {
+		if (g.Voxels[i].Exists || g.Voxels[i].IsLoad || g.Voxels[i].IsSupport) && g.Voxels[i].Stress > maxStress {
 			maxStress = g.Voxels[i].Stress
 		}
 	}
@@ -127,6 +168,11 @@ func (g *Grid) ComputeStress() {
 func (g *Grid) ComputeSensitivity(history []*Grid) {
 	for i := range g.Voxels {
 		v := &g.Voxels[i]
+		fatigueFactor := 1.0
+		if v.FatigueDamage > FATIGUE_WARNING {
+			fatigueFactor = 1.0 + v.FatigueDamage * 2.0
+		}
+
 		if !v.Exists {
 			neighbors := g.getDiagonalNeighbors(i)
 			avgNeighborStress := 0.0
@@ -138,12 +184,12 @@ func (g *Grid) ComputeSensitivity(history []*Grid) {
 				}
 			}
 			if existingCount > 0 {
-				v.Sensitivity = avgNeighborStress / float64(existingCount) * 0.8
+				v.Sensitivity = avgNeighborStress / float64(existingCount) * 0.8 * fatigueFactor
 			} else {
 				v.Sensitivity = 0
 			}
 		} else {
-			v.Sensitivity = v.Stress
+			v.Sensitivity = v.Stress * fatigueFactor
 		}
 
 		if v.IsLoad || v.IsSupport {
@@ -164,6 +210,8 @@ func (g *Grid) ComputeSensitivity(history []*Grid) {
 
 func (g *Grid) Evolve(er, ar float64) []VoxelChange {
 	g.ComputeStress()
+	g.RecordStressForFatigue()
+	g.ComputeFatigueDamage()
 
 	history := []*Grid{}
 	g.ComputeSensitivity(history)
@@ -231,16 +279,17 @@ func (g *Grid) Evolve(er, ar float64) []VoxelChange {
 	removed := 0
 	for i := 0; i < removeCount && removed < removeCount; i++ {
 		idx := existingSensitivities[i].idx
-		if g.Voxels[idx].Exists && !g.Voxels[idx].IsLoad && !g.Voxels[idx].IsSupport {
+		if g.Voxels[idx].Exists && g.Voxels[idx].FatigueDamage < FATIGUE_LIMIT && !g.Voxels[idx].IsLoad && !g.Voxels[idx].IsSupport {
 			g.Voxels[idx].Exists = false
 			x, y, z := g.IndexToCoord(idx)
 			changes = append(changes, VoxelChange{
-				Index:  idx,
-				X:      x,
-				Y:      y,
-				Z:      z,
-				Action: ActionRemove,
-				Stress: g.Voxels[idx].Stress,
+				Index:         idx,
+				X:             x,
+				Y:             y,
+				Z:             z,
+				Action:        ActionRemove,
+				Stress:        g.Voxels[idx].Stress,
+				FatigueDamage: g.Voxels[idx].FatigueDamage,
 			})
 			g.CurrentVolume--
 			removed++
@@ -263,12 +312,13 @@ func (g *Grid) Evolve(er, ar float64) []VoxelChange {
 				g.Voxels[idx].Exists = true
 				x, y, z := g.IndexToCoord(idx)
 				changes = append(changes, VoxelChange{
-					Index:  idx,
-					X:      x,
-					Y:      y,
-					Z:      z,
-					Action: ActionAdd,
-					Stress: g.Voxels[idx].Stress,
+					Index:         idx,
+					X:             x,
+					Y:             y,
+					Z:             z,
+					Action:        ActionAdd,
+					Stress:        g.Voxels[idx].Stress,
+					FatigueDamage: g.Voxels[idx].FatigueDamage,
 				})
 				g.CurrentVolume++
 				added++
@@ -280,11 +330,71 @@ func (g *Grid) Evolve(er, ar float64) []VoxelChange {
 	return changes
 }
 
+func (g *Grid) StepTimeDynamic(er, ar float64) TimeStepResult {
+	g.StepTime()
+	g.ComputeStress()
+	g.RecordStressForFatigue()
+
+	result := TimeStepResult{
+		TimeStep:      g.TimeStep,
+		Time:          g.Time,
+		StressUpdated: true,
+	}
+
+	if g.ShouldDoAnalysis() {
+		g.ComputeFatigueDamage()
+		result.FatigueUpdated = true
+		if len(g.LoadPoints) > 0 && len(g.SupportPoints) > 0 && g.TimeStep >= g.StepsPerAnalysis {
+			result.Changes = g.Evolve(er, ar)
+			result.DidAnalysis = true
+		}
+	}
+
+	return result
+}
+
+func (g *Grid) GetCurrentLoadValue() float64 {
+	if len(g.DynamicLoads) == 0 {
+		return 1.0
+	}
+	return g.GetCurrentLoadMagnitude(&g.DynamicLoads[0])
+}
+
 func (g *Grid) IsConverged() bool {
 	currentRatio := float64(g.CurrentVolume) / float64(g.TotalVolume)
-	return math.Abs(currentRatio-g.TargetVolumeRatio) < 0.01 || g.Iteration >= 100
+	return math.Abs(currentRatio-g.TargetVolumeRatio) < 0.01 || g.Iteration >= 200
 }
 
 func (g *Grid) GetVolumeRatio() float64 {
 	return float64(g.CurrentVolume) / float64(g.TotalVolume)
+}
+
+func (g *Grid) GetMaxFatigueDamage() float64 {
+	maxFatigue := 0.0
+	for i := range g.Voxels {
+		if g.Voxels[i].FatigueDamage > maxFatigue {
+			maxFatigue = g.Voxels[i].FatigueDamage
+		}
+	}
+	return maxFatigue
+}
+
+func (g *Grid) GetFatigueWarningCount() int {
+	count := 0
+	for i := range g.Voxels {
+		if g.Voxels[i].Exists && g.Voxels[i].FatigueDamage >= FATIGUE_WARNING {
+			count++
+		}
+	}
+	return count
+}
+
+func (g *Grid) GetFatigueCriticalCount() int {
+	count := 0
+	for i := range g.Voxels {
+		if g.Voxels[i].Exists && g.Voxels[i].FatigueDamage >= FATIGUE_LIMIT {
+			count++
+		}
+	}
+	return count
 }
